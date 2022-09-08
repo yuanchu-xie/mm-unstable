@@ -61,6 +61,10 @@
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
 #include <linux/sched/sysctl.h>
+#include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
+#include <linux/rcupdate.h>
 
 #include "internal.h"
 #include "swap.h"
@@ -3404,12 +3408,41 @@ static void reset_mm_stats(struct lruvec *lruvec, struct lru_gen_mm_walk *walk, 
 	}
 }
 
+struct bpf_mglru_should_skip_mm_control {
+	pid_t pid;
+	bool should_skip;
+};
+
+void bpf_set_skip_mm(struct bpf_mglru_should_skip_mm_control *ctl)
+{
+	ctl->should_skip = true;
+}
+
+__weak noinline void
+bpf_mglru_should_skip_mm(struct bpf_mglru_should_skip_mm_control *ctl)
+{
+}
+
+static bool bpf_mglru_should_skip_mm_wrapper(pid_t pid)
+{
+	struct bpf_mglru_should_skip_mm_control ctl = {
+		.pid = pid,
+		.should_skip = false,
+	};
+
+	bpf_mglru_should_skip_mm(&ctl);
+	return ctl.should_skip;
+}
+
 static bool should_skip_mm(struct mm_struct *mm, struct lru_gen_mm_walk *walk)
 {
 	int type;
 	unsigned long size = 0;
 	struct pglist_data *pgdat = lruvec_pgdat(walk->lruvec);
 	int key = pgdat->node_id % BITS_PER_TYPE(mm->lru_gen.bitmap);
+#ifdef CONFIG_MEMCG
+	struct task_struct *task;
+#endif
 
 	if (!walk->force_scan && !test_bit(key, &mm->lru_gen.bitmap))
 		return true;
@@ -3424,6 +3457,16 @@ static bool should_skip_mm(struct mm_struct *mm, struct lru_gen_mm_walk *walk)
 
 	if (size < MIN_LRU_BATCH)
 		return true;
+
+#ifdef CONFIG_MEMCG
+	rcu_read_lock();
+	task = rcu_dereference(mm->owner);
+	if (task && bpf_mglru_should_skip_mm_wrapper(task->pid)) {
+		rcu_read_unlock();
+		return true;
+	}
+	rcu_read_unlock();
+#endif
 
 	return !mmget_not_zero(mm);
 }
@@ -3856,6 +3899,22 @@ static bool suitable_to_scan(int total, int young)
 	return young * n >= total;
 }
 
+/*
+ * __weak noinline guarantees that both the function and the callsite are
+ * preserved
+ */
+__weak noinline void mglru_pte_probe(pid_t pid, unsigned int nid, unsigned long addr,
+				     unsigned long len, bool anon)
+{
+
+}
+
+__weak noinline void mglru_pmd_probe(pid_t pid, unsigned int nid, unsigned long addr,
+				     unsigned long len, bool anon)
+{
+
+}
+
 static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 			   struct mm_walk *args)
 {
@@ -3912,6 +3971,8 @@ restart:
 			folio_mark_dirty(folio);
 
 		old_gen = folio_update_gen(folio, new_gen);
+		mglru_pte_probe(walk->pid, pgdat->node_id, addr, folio_nr_pages(folio),
+				folio_test_anon(folio));
 		if (old_gen >= 0 && old_gen != new_gen)
 			update_batch_size(walk, folio, old_gen, new_gen);
 	}
@@ -3992,6 +4053,8 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
 			folio_mark_dirty(folio);
 
 		old_gen = folio_update_gen(folio, new_gen);
+		mglru_pmd_probe(walk->pid, pgdat->node_id, addr, folio_nr_pages(folio),
+				folio_test_anon(folio));
 		if (old_gen >= 0 && old_gen != new_gen)
 			update_batch_size(walk, folio, old_gen, new_gen);
 next:
@@ -4153,6 +4216,7 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
 	int err;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 
+	walk->pid = mm->owner->pid;
 	walk->next_addr = FIRST_USER_ADDRESS;
 
 	do {
@@ -5638,6 +5702,95 @@ done:
 
 	return err;
 }
+
+int bpf_run_aging(int memcg_id, bool can_swap,
+			 bool force_scan)
+{
+	struct scan_control sc = {
+		.may_writepage = true,
+		.may_unmap = true,
+		.may_swap = true,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.gfp_mask = GFP_KERNEL,
+	};
+	int err = -EINVAL;
+	struct mem_cgroup *memcg = NULL;
+	struct blk_plug plug;
+	unsigned int flags;
+	unsigned int nid;
+
+	if (!mem_cgroup_disabled()) {
+		rcu_read_lock();
+		memcg = mem_cgroup_from_id(memcg_id);
+#ifdef CONFIG_MEMCG
+		if (memcg && !css_tryget(&memcg->css))
+			memcg = NULL;
+#endif
+		rcu_read_unlock();
+
+		if (!memcg)
+			return -EINVAL;
+	}
+
+	if (memcg_id != mem_cgroup_id(memcg)) {
+		mem_cgroup_put(memcg);
+		return err;
+	}
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	flags = memalloc_noreclaim_save();
+	blk_start_plug(&plug);
+	if (!set_mm_walk(NULL)) {
+		err = -ENOMEM;
+		goto done;
+	}
+
+	for_each_online_node(nid) {
+		struct lruvec *lruvec = get_lruvec(memcg, nid);
+		DEFINE_MAX_SEQ(lruvec);
+
+		err = run_aging(lruvec, max_seq, &sc, can_swap, force_scan);
+		if (err) {
+			goto done;
+		}
+	}
+done:
+	clear_mm_walk();
+	blk_finish_plug(&plug);
+	memalloc_noreclaim_restore(flags);
+	set_task_reclaim_state(current, NULL);
+	mem_cgroup_put(memcg);
+
+	return err;
+}
+
+BTF_SET8_START(bpf_lru_gen_trace_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_set_skip_mm)
+BTF_SET8_END(bpf_lru_gen_trace_kfunc_ids)
+
+BTF_SET8_START(bpf_lru_gen_syscall_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_run_aging)
+BTF_SET8_END(bpf_lru_gen_syscall_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_lru_gen_trace_kfunc_set = {
+  .owner = THIS_MODULE,
+  .set = &bpf_lru_gen_trace_kfunc_ids,
+};
+
+static const struct btf_kfunc_id_set bpf_lru_gen_syscall_kfunc_set = {
+  .owner = THIS_MODULE,
+  .set = &bpf_lru_gen_syscall_kfunc_ids,
+};
+
+static int __init bpf_lru_gen_kfunc_init(void)
+{
+  int err = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_lru_gen_trace_kfunc_set);
+  if (err)
+    return err;
+  return register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_lru_gen_syscall_kfunc_set);
+}
+late_initcall(bpf_lru_gen_kfunc_init);
+
 
 /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
 static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,

@@ -470,6 +470,7 @@ struct lru_gen_mm_walk {
 	int mm_stats[NR_MM_STATS];
 	/* total batched items */
 	int batched;
+	pid_t pid;
 	bool can_swap;
 	bool force_scan;
 };
